@@ -18,6 +18,7 @@ HC_URL = os.environ.get("HC_URL", "")          # optional healthchecks.io ping U
 TRADE_USD = 500
 STATE_FILE = "state.json"
 LOG_FILE = "paper_trades.csv"
+MAX_LATE = 0.0025                              # never buy more than +0.25% above the hour open
 SETUP_FILE = "setups.csv"                      # EVERY setup: bought, skipped (trade open) or no trigger
 
 
@@ -91,7 +92,9 @@ def scan_one(sym, scan_ts):
     if not d or len(d) < sc.MIN_AGE_DAYS:
         return None
     inf = {k2: float(v) for k2, v in info[len(C) - 1].items()}
-    return dict(sym=sym, candle_open_ms=int(closed[-1][0]), ema_dist=C[-1] / inf["ema"] - 1, **inf)
+    nxt = [x for x in k if int(x[0]) == int(closed[-1][0]) + HOUR * 1000]       # the candle now forming
+    return dict(sym=sym, candle_open_ms=int(closed[-1][0]), ema_dist=C[-1] / inf["ema"] - 1,
+                next_open=float(nxt[0][1]) if nxt else None, **inf)
 
 
 def hourly_scan(state):
@@ -107,6 +110,10 @@ def hourly_scan(state):
         sc.tg(f"🟡 SETUP — {r['sym']}USDT{busy}\n"
               f"Setup candle closed {jd(entry_hour_ms / 1000):%d %b %H:%M} (Jeddah)\n"
               f"RSI {r['rsi']:.1f} | above EMA100 ✅ | crash candles {int(r['crash'])} | G1 +{r['p1']:.2f}% G2 +{r['p2']:.2f}%\n"
+              + (f"👉 Place now: STOP-LIMIT BUY  stop {sc.fmt(r['next_open'] * 1.0005)}  limit {sc.fmt(r['next_open'] * (1 + MAX_LATE))}\n"
+                 f"   then LIMIT SELL at {sc.fmt(r['next_open'] * 1.02)} once filled\n"
+                 f"   ❌ Never buy above {sc.fmt(r['next_open'] * (1 + MAX_LATE))} (late entry kills the edge)\n"
+                 if r.get("next_open") else "") +
               f"Wait for my BUY NOW message (price must rise 0.05% above this hour's open).\n"
               f"Chart: https://www.tradingview.com/chart/?symbol=BINANCE:{r['sym']}USDT")
     state["last_scan_hour"] = int(scan_ts // HOUR)
@@ -135,6 +142,7 @@ def watch_pending(state):
         sell_by_ms = p["entry_hour_ms"] + sc.MAX_HOLD * HOUR * 1000
         msg = (f"🟢 BUY NOW — {sym}USDT\n"
                f"Hour open {sc.fmt(o)} | trigger {sc.fmt(trig)} hit | price now {sc.fmt(c)}\n"
+               f"❌ Do NOT buy above {sc.fmt(o * (1 + MAX_LATE))} (more than +0.25% late = skip)\n"
                f"🎯 Put LIMIT SELL at {sc.fmt(tp)} (+2% from open)\n"
                f"⏰ If not sold, sell at market at {jd(sell_by_ms / 1000):%d %b %H:%M} (Jeddah)")
         if state["trade"] is None:
