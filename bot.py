@@ -5,6 +5,7 @@ ICT Rule v3 LIVE BOT — runs 24/7 on a small cloud server (VPS).
   • Price passes trigger -> Telegram "BUY NOW" + opens a PAPER trade (one at a time, $500).
   • Watches the paper trade: +2% target (uses candle highs, so wicks are not missed) or 12h exit.
   • Logs every paper trade to paper_trades.csv and sends a daily summary.
+  • Logs EVERY setup to setups.csv (no trigger / taken / skipped) with its full result, for later analysis.
   • Pings healthchecks.io every hour (optional) so you get warned if the bot stops.
 Same rule logic as the backtest (find_setups in scanner.py, checked 104/104 against the backtest).
 """
@@ -17,6 +18,31 @@ HC_URL = os.environ.get("HC_URL", "")          # optional healthchecks.io ping U
 TRADE_USD = 500
 STATE_FILE = "state.json"
 LOG_FILE = "paper_trades.csv"
+SETUP_FILE = "setups.csv"                      # EVERY setup: bought, skipped (trade open) or no trigger
+
+
+SETUP_COLS = ["setup_candle_close_jeddah", "coin", "rsi", "crash_candles", "g1_pct", "g2_pct", "pct_above_ema100",
+              "status", "hour_open", "trigger", "target", "exit_reason", "exit_price", "result_pct",
+              "result_pct_backtest_way", "worst_open_loss_pct", "hold_hours", "exit_time_jeddah"]
+
+
+def write_setup_row(row):
+    """setups.csv = EVERY setup with what happened (or would have happened) — for later analysis."""
+    new = not os.path.exists(SETUP_FILE)
+    with open(SETUP_FILE, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=SETUP_COLS)
+        if new:
+            w.writeheader()
+        w.writerow({k: row.get(k, "") for k in SETUP_COLS})
+
+
+def setup_base(p, status):
+    return dict(setup_candle_close_jeddah=jd(p["entry_hour_ms"] / 1000).strftime("%Y-%m-%d %H:%M"),
+                coin=p["sym"], rsi=round(p["rsi"], 1), crash_candles=int(p["crash"]),
+                g1_pct=round(p["p1"], 2), g2_pct=round(p["p2"], 2),
+                pct_above_ema100=round(p.get("ema_dist", 0) * 100, 2), status=status)
+
+
 HOUR = 3600
 JEDDAH = sc.JEDDAH
 
@@ -64,7 +90,8 @@ def scan_one(sym, scan_ts):
     d = klines(sym, "1d", sc.MIN_AGE_DAYS)
     if not d or len(d) < sc.MIN_AGE_DAYS:
         return None
-    return dict(sym=sym, candle_open_ms=int(closed[-1][0]), **{k2: float(v) for k2, v in info[len(C) - 1].items()})
+    inf = {k2: float(v) for k2, v in info[len(C) - 1].items()}
+    return dict(sym=sym, candle_open_ms=int(closed[-1][0]), ema_dist=C[-1] / inf["ema"] - 1, **inf)
 
 
 def hourly_scan(state):
@@ -94,6 +121,7 @@ def watch_pending(state):
     for sym, p in list(state["pending"].items()):
         if t * 1000 >= p["entry_hour_ms"] + HOUR * 1000:            # hour over, no trigger
             sc.tg(f"⚪ {sym}USDT: no trigger this hour — setup cancelled.")
+            write_setup_row(setup_base(p, "no trigger"))
             del state["pending"][sym]
             continue
         k = sc.api("/api/v3/klines", {"symbol": sym + "USDT", "interval": "1h",
@@ -113,9 +141,13 @@ def watch_pending(state):
             state["trade"] = dict(sym=sym, open=o, entry=trig, tp=tp, entry_hour_ms=p["entry_hour_ms"],
                                   sell_by_ms=sell_by_ms, worst=0.0, setup=p)
             msg += "\n📝 Paper trade OPENED ($500)."
+            status = "taken by paper bot"
         else:
             msg += f"\n⚠️ Paper bot skips it: {state['trade']['sym']} trade still open (one trade at a time)."
+            status = f"skipped ({state['trade']['sym']} trade open)"
         sc.tg(msg)
+        state.setdefault("shadow", []).append(dict(sym=sym, open=o, entry=trig, tp=tp, entry_hour_ms=p["entry_hour_ms"],
+                                                   sell_by_ms=sell_by_ms, worst=0.0, setup=p, status=status))
         del state["pending"][sym]
     save_state(state)
 
@@ -169,6 +201,39 @@ def watch_trade(state):
     save_state(state)
 
 
+# ---------------- record result of EVERY triggered setup (taken or skipped) ----------------
+def watch_shadows(state):
+    keep = []
+    for sh in state.get("shadow", []):
+        k = sc.api("/api/v3/klines", {"symbol": sh["sym"] + "USDT", "interval": "1h",
+                                      "startTime": sh["entry_hour_ms"], "limit": 14})
+        if not k:
+            keep.append(sh); continue
+        t_ms = now() * 1000; done = None
+        for x in k:
+            st, o, h, l, c, close_ms = int(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4]), int(x[6])
+            if st >= sh["sell_by_ms"]:
+                break
+            sh["worst"] = min(sh["worst"], l / sh["entry"] - 1)
+            if h >= sh["tp"]:
+                done = ("target", max(sh["tp"], o) if st > sh["entry_hour_ms"] else sh["tp"], st); break
+            if st + HOUR * 1000 >= sh["sell_by_ms"] and close_ms < t_ms:
+                done = ("12h", c, st); break
+        if not done:
+            keep.append(sh); continue
+        why, px, st = done
+        row = setup_base(sh["setup"], sh["status"])
+        row.update(hour_open=sh["open"], trigger=round(sh["entry"], 8), target=round(sh["tp"], 8), exit_reason=why,
+                   exit_price=round(px, 8), result_pct=round((px / sh["entry"] - 1) * 100, 3),
+                   result_pct_backtest_way=round((px / sh["open"] - 1) * 100, 3),
+                   worst_open_loss_pct=round(sh["worst"] * 100, 2),
+                   hold_hours=int((st - sh["entry_hour_ms"]) / 3600000) + 1,
+                   exit_time_jeddah=jd(t_ms / 1000).strftime("%Y-%m-%d %H:%M"))
+        write_setup_row(row)
+    state["shadow"] = keep
+    save_state(state)
+
+
 # ------------------------------ daily summary ------------------------------
 def daily_summary(state):
     t = jd(now())
@@ -200,7 +265,7 @@ def ping():
 # ------------------------------ main loop ------------------------------
 def main():
     state = load_state()
-    last_err = [0.0]
+    last_err = [0.0]; last_shadow = [0.0]
     sc.tg("🤖 Rule v3 bot started.")
     while True:
         try:
@@ -213,6 +278,9 @@ def main():
                 watch_pending(state)
             if state["trade"]:
                 watch_trade(state)
+            if state.get("shadow") and now() - last_shadow[0] >= 60:
+                last_shadow[0] = now()
+                watch_shadows(state)
             daily_summary(state)
         except Exception:
             traceback.print_exc()
