@@ -6,6 +6,7 @@ ICT Rule v3 LIVE BOT — runs 24/7 on a small cloud server (VPS).
   • Watches the paper trade: +2% target (uses candle highs, so wicks are not missed) or 12h exit.
   • Logs every paper trade to paper_trades.csv and sends a daily summary.
   • Logs EVERY setup to setups.csv (no trigger / taken / skipped) with its full result, for later analysis.
+  • HEADS-UP at minute 55 when a setup is forming (logged to prealerts.csv to measure its accuracy).
   • Pings healthchecks.io every hour (optional) so you get warned if the bot stops.
 Same rule logic as the backtest (find_setups in scanner.py, checked 104/104 against the backtest).
 """
@@ -76,11 +77,11 @@ def klines(sym, interval="1h", limit=1000):
 
 
 # ------------------------------ hourly scan ------------------------------
-def scan_one(sym, scan_ts):
+def scan_one(sym, scan_ts, include_forming=False):
     k = klines(sym)
     if not k or len(k) < 800:
         return None
-    closed = [x for x in k if x[6] < scan_ts * 1000]
+    closed = k if include_forming else [x for x in k if x[6] < scan_ts * 1000]
     if not closed or closed[-1][0] < (scan_ts - 2 * HOUR) * 1000:      # stale / halted coin
         return None
     O = np.array([float(x[1]) for x in closed]); H = np.array([float(x[2]) for x in closed])
@@ -94,7 +95,7 @@ def scan_one(sym, scan_ts):
     inf = {k2: float(v) for k2, v in info[len(C) - 1].items()}
     nxt = [x for x in k if int(x[0]) == int(closed[-1][0]) + HOUR * 1000]       # the candle now forming
     return dict(sym=sym, candle_open_ms=int(closed[-1][0]), ema_dist=C[-1] / inf["ema"] - 1,
-                next_open=float(nxt[0][1]) if nxt else None, **inf)
+                body=(C[-1] / O[-1] - 1) * 100, next_open=float(nxt[0][1]) if nxt else None, **inf)
 
 
 def hourly_scan(state):
@@ -119,6 +120,39 @@ def hourly_scan(state):
     state["last_scan_hour"] = int(scan_ts // HOUR)
     save_state(state)
     print(f"{jd(scan_ts):%Y-%m-%d %H:%M:%S} scanned {len(syms)} coins, setups {len(hits)}", flush=True)
+
+
+# ------------- HEADS-UP 5 minutes before the candle closes (forming candle treated as closed) -------------
+PRE_FILE = "prealerts.csv"
+
+
+def pre_scan(state):
+    scan_ts = now()
+    syms = sc.symbols()
+    with ThreadPoolExecutor(10) as ex:
+        hits = [r for r in ex.map(lambda s: scan_one(s, scan_ts, include_forming=True), syms) if r]
+    closes_at = jd((int(scan_ts // HOUR) + 1) * HOUR)
+    for r in hits:
+        # tested 2 Nov 2026 (pre_alert_results.xlsx, 325 coins, May-Oct 2026, 5-min data):
+        # HIGH = candle red by 0.3%+, RSI 1+ inside 30-40, price 0.3%+ above EMA100 -> 96.5% became a setup
+        # other heads-ups at minute 55 -> 70.3% became a setup
+        high = r["body"] <= -0.3 and min(r["rsi"] - 30, 40 - r["rsi"]) >= 1 and r["ema_dist"] >= 0.003
+        r["conf"] = "HIGH" if high else "MEDIUM"
+        tag = "🔥 HIGH (≈96% become a setup)" if high else "⏳ MEDIUM (≈70% become a setup)"
+        sc.tg(f"{tag} — {r['sym']}USDT may give a setup at {closes_at:%H:%M} (Jeddah)\n"
+              f"RSI now {r['rsi']:.1f} | candle {r['body']:+.2f}% | {r['ema_dist'] * 100:+.2f}% above EMA100\n"
+              f"Get ready (open the exchange). Do NOT buy yet — buying before the close tested WORSE.\n"
+              f"Wait for 🟡 SETUP after the close.")
+        new = not os.path.exists(PRE_FILE)
+        with open(PRE_FILE, "a", newline="") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(["alert_time_jeddah", "candle_close_jeddah", "coin", "rsi_at_alert", "confidence"])
+            w.writerow([jd(scan_ts).strftime("%Y-%m-%d %H:%M"), closes_at.strftime("%Y-%m-%d %H:%M"),
+                        r["sym"], round(r["rsi"], 1), r["conf"]])
+    state["last_pre_hour"] = int(scan_ts // HOUR)
+    save_state(state)
+    print(f"{jd(scan_ts):%Y-%m-%d %H:%M:%S} pre-scan {len(syms)} coins, heads-up {len(hits)}", flush=True)
 
 
 # --------------------------- trigger + trade watch ---------------------------
@@ -282,6 +316,8 @@ def main():
             if hour_no > state.get("last_scan_hour", 0) and t - hour_no * HOUR >= 3:
                 hourly_scan(state)
                 ping()
+            if t - hour_no * HOUR >= 3300 and state.get("last_pre_hour") != hour_no:   # minute 55
+                pre_scan(state)
             if state["pending"]:
                 watch_pending(state)
             if state["trade"]:
